@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid32280",
+  "B": "/home/dev/feedback/uid32280",
+  "sha": "405b9078c01c392c698e5644be6266d61845762f",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "megadose",
+    "repo": "holehe",
+    "sha": "405b9078c01c392c698e5644be6266d61845762f"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "holehe",
+    "cloneUrl": "https://github.com/Rrr119/holehe.git"
+  },
+  "at": "2026-11-22T06:21:08.377Z"
+}

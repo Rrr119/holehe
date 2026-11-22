@@ -47,6 +47,20 @@ Holehe can be run from the CLI and rapidly embedded within existing python appli
 ```bash
 holehe test@gmail.com
 ```
+
+Batch lookups accept multiple positional addresses or an email list file:
+
+```bash
+holehe alice@example.com bob@example.com
+holehe --email-file targets.txt --concurrency 10 --rate-limit 20
+```
+
+- Duplicate addresses are removed case-insensitively before any request is made.
+- `--concurrency` (default `10`) limits how many site modules run at once.
+- `--rate-limit` (default `20`) limits HTTP requests per second across the whole batch; use `0` to disable pacing.
+- Each email still prints the original per-site result block. A single email keeps the existing CSV format; multi-email runs write one `holehe_<timestamp>_batch_results.csv` with an added `email` column.
+- `--no-update` skips the PyPI version check, which is useful for unattended batch jobs.
+
 ### 📈 Python Example
 
 ```python
@@ -92,6 +106,13 @@ For each module, data is returned in a standard dictionary with the following js
 
 Rate limit? Change your IP.
 
+## Tests
+
+The batch suite checks 100 unique emails, input/result deduplication, the concurrency cap, timed request pacing, redirect pacing, and legacy single-email output:
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## Maltego Transform : [Holehe Maltego](https://github.com/megadose/holehe-maltego)
 

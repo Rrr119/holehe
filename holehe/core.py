@@ -5,7 +5,8 @@ import trio
 
 from subprocess import Popen, PIPE
 import os
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
+import copy
 import csv
 from datetime import datetime
 import time
@@ -30,6 +31,8 @@ except Exception:
 
 DEBUG        = False
 EMAIL_FORMAT = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+DEFAULT_CONCURRENCY = 10
+DEFAULT_RATE_LIMIT = 20.0
 
 __version__ = "1.61"
 
@@ -103,6 +106,152 @@ def is_email(email: str) -> bool:
 
     return bool(re.fullmatch(EMAIL_FORMAT, email))
 
+
+def deduplicate_emails(emails):
+    """Remove duplicate emails while preserving their first spelling and order."""
+    seen = set()
+    unique = []
+    for raw_email in emails:
+        email = raw_email.strip()
+        key = email.casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(email)
+    return unique
+
+
+def read_email_file(path):
+    """Read one email address per line, ignoring blank lines and comments."""
+    emails = []
+    with open(path, "r", encoding="utf-8") as email_file:
+        for line in email_file:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                emails.append(line)
+    return emails
+
+
+def collect_emails(args):
+    """Collect positional and file-based emails, then deduplicate them."""
+    emails = list(args.email or [])
+    for path in args.email_file or []:
+        emails.extend(read_email_file(path))
+    return deduplicate_emails(emails)
+
+
+def validate_emails(emails):
+    """Validate every target before starting any network request."""
+    if not emails:
+        raise SystemExit(
+            "[-] Please enter a target email ! \n"
+            "Example : holehe email@example.com"
+        )
+
+    invalid = [email for email in emails if not is_email(email)]
+    if invalid:
+        preview = ", ".join(invalid[:5])
+        if len(invalid) > 5:
+            preview += ", ..."
+        raise SystemExit("[-] Invalid email address(es): " + preview)
+
+    return emails
+
+
+def _result_score(result):
+    if result.get("exists") is True:
+        priority = 4
+    elif result.get("rateLimit") is True:
+        priority = 3
+    elif result.get("error") is True:
+        priority = 2
+    else:
+        priority = 1
+    populated = sum(
+        value is not None for value in result.values()
+    )
+    return priority, populated
+
+
+def deduplicate_results(data):
+    """Collapse duplicate site records, preferring the most useful result."""
+    deduplicated = {}
+    for result in data:
+        key = (result.get("name"), result.get("domain"))
+        current = deduplicated.get(key)
+        if current is None or _result_score(result) > _result_score(current):
+            deduplicated[key] = result
+    return list(deduplicated.values())
+
+
+def batch_csv_rows(results):
+    """Flatten batch results into rows while retaining all module fields."""
+    rows = []
+    for email, data in results:
+        for result in data:
+            row = {"email": email}
+            row.update(result)
+            rows.append(row)
+    return rows
+
+
+def positive_int(value):
+    """Argparse type for an integer greater than zero."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ArgumentTypeError("must be an integer") from exc
+    if parsed < 1:
+        raise ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def non_negative_float(value):
+    """Argparse type for a non-negative float."""
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ArgumentTypeError("must be a number") from exc
+    if parsed < 0:
+        raise ArgumentTypeError("must be zero or greater")
+    return parsed
+
+
+class AsyncRateLimiter:
+    """Serialize request starts to a maximum number of requests per second."""
+
+    def __init__(self, rate_limit):
+        self.rate_limit = float(rate_limit)
+        self._lock = trio.Lock()
+        self._next_request_at = None
+
+    async def acquire(self):
+        if self.rate_limit <= 0:
+            return
+
+        interval = 1.0 / self.rate_limit
+        async with self._lock:
+            now = trio.current_time()
+            if self._next_request_at is None:
+                self._next_request_at = now
+            delay = self._next_request_at - now
+            if delay > 0:
+                await trio.sleep(delay)
+                now = trio.current_time()
+            self._next_request_at = max(now, self._next_request_at) + interval
+
+
+class RateLimitedAsyncClient(httpx.AsyncClient):
+    """An httpx client that applies a global request rate limit."""
+
+    def __init__(self, *args, rate_limit=0, **kwargs):
+        self._rate_limiter = AsyncRateLimiter(rate_limit)
+        super().__init__(*args, **kwargs)
+
+    async def _send_single_request(self, request):
+        await self._rate_limiter.acquire()
+        return await super()._send_single_request(request)
+
+
 def print_result(data,args,email,start_time,websites):
     def print_color(text,color,args):
         if args.nocolor == False:
@@ -163,24 +312,90 @@ def export_csv(data,args,email):
             fc.writerows(data)
         exit("All results have been exported to "+name_file)
 
-async def launch_module(module,email, client, out):
+
+def export_batch_csv(results, args):
+    """Export all batch results to one CSV containing an email column."""
+    if args.csvoutput == True:
+        now = datetime.now()
+        timestamp = datetime.timestamp(now)
+        name_file = "holehe_"+str(round(timestamp))+"_batch_results.csv"
+        rows = batch_csv_rows(results)
+        fieldnames = ["email"]
+        for row in rows:
+            for field in row:
+                if field not in fieldnames:
+                    fieldnames.append(field)
+        with open(name_file, 'w', encoding='utf8', newline='') as output_file:
+            fc = csv.DictWriter(output_file, fieldnames=fieldnames)
+            fc.writeheader()
+            fc.writerows(rows)
+        exit("All results have been exported to "+name_file)
+
+
+async def launch_module(module,email, client, out, limiter=None):
     data={'aboutme': 'about.me', 'adobe': 'adobe.com', 'amazon': 'amazon.com', 'anydo': 'any.do', 'archive': 'archive.org', 'armurerieauxerre': 'armurerie-auxerre.com', 'atlassian': 'atlassian.com', 'babeshows': 'babeshows.co.uk', 'badeggsonline': 'badeggsonline.com', 'biosmods': 'bios-mods.com', 'biotechnologyforums': 'biotechnologyforums.com', 'bitmoji': 'bitmoji.com', 'blablacar': 'blablacar.com', 'blackworldforum': 'blackworldforum.com', 'blip': 'blip.fm', 'blitzortung': 'forum.blitzortung.org', 'bluegrassrivals': 'bluegrassrivals.com', 'bodybuilding': 'bodybuilding.com', 'buymeacoffee': 'buymeacoffee.com', 'cambridgemt': 'discussion.cambridge-mt.com', 'caringbridge': 'caringbridge.org', 'chinaphonearena': 'chinaphonearena.com', 'clashfarmer': 'clashfarmer.com', 'codecademy': 'codecademy.com', 'codeigniter': 'forum.codeigniter.com', 'codepen': 'codepen.io', 'coroflot': 'coroflot.com', 'cpaelites': 'cpaelites.com', 'cpahero': 'cpahero.com', 'cracked_to': 'cracked.to', 'crevado': 'crevado.com', 'deliveroo': 'deliveroo.com', 'demonforums': 'demonforums.net', 'devrant': 'devrant.com', 'diigo': 'diigo.com', 'discord': 'discord.com', 'docker': 'docker.com', 'dominosfr': 'dominos.fr', 'ebay': 'ebay.com', 'ello': 'ello.co', 'envato': 'envato.com', 'eventbrite': 'eventbrite.com', 'evernote': 'evernote.com', 'fanpop': 'fanpop.com', 'firefox': 'firefox.com', 'flickr': 'flickr.com', 'freelancer': 'freelancer.com', 'freiberg': 'drachenhort.user.stunet.tu-freiberg.de', 'garmin': 'garmin.com', 'github': 'github.com', 'google': 'google.com', 'gravatar': 'gravatar.com', 'imgur': 'imgur.com', 'instagram': 'instagram.com', 'issuu': 'issuu.com', 'koditv': 'forum.kodi.tv', 'komoot': 'komoot.com', 'laposte': 'laposte.fr', 'lastfm': 'last.fm', 'lastpass': 'lastpass.com', 'mail_ru': 'mail.ru', 'mybb': 'community.mybb.com', 'myspace': 'myspace.com', 'nattyornot': 'nattyornotforum.nattyornot.com', 'naturabuy': 'naturabuy.fr', 'ndemiccreations': 'forum.ndemiccreations.com', 'nextpvr': 'forums.nextpvr.com', 'nike': 'nike.com', 'odnoklassniki': 'ok.ru', 'office365': 'office365.com', 'onlinesequencer': 'onlinesequencer.net', 'parler': 'parler.com', 'patreon': 'patreon.com', 'pinterest': 'pinterest.com', 'plurk': 'plurk.com', 'pornhub': 'pornhub.com', 'protonmail': 'protonmail.ch', 'quora': 'quora.com', 'rambler': 'rambler.ru', 'redtube': 'redtube.com', 'replit': 'replit.com', 'rocketreach': 'rocketreach.co', 'samsung': 'samsung.com', 'seoclerks': 'seoclerks.com', 'sevencups': '7cups.com', 'smule': 'smule.com', 'snapchat': 'snapchat.com', 'soundcloud': 'soundcloud.com', 'sporcle': 'sporcle.com', 'spotify': 'spotify.com', 'strava': 'strava.com', 'taringa': 'taringa.net', 'teamtreehouse': 'teamtreehouse.com', 'tellonym': 'tellonym.me', 'thecardboard': 'thecardboard.org', 'therianguide': 'forums.therian-guide.com', 'thevapingforum': 'thevapingforum.com', 'tumblr': 'tumblr.com', 'tunefind': 'tunefind.com', 'twitter': 'twitter.com', 'venmo': 'venmo.com', 'vivino': 'vivino.com', 'voxmedia': 'voxmedia.com', 'vrbo': 'vrbo.com', 'vsco': 'vsco.co', 'wattpad': 'wattpad.com', 'wordpress': 'wordpress.com', 'xing': 'xing.com', 'xnxx': 'xnxx.com', 'xvideos': 'xvideos.com', 'yahoo': 'yahoo.com','hubspot': 'hubspot.com', 'pipedrive': 'pipedrive.com', 'insightly': 'insightly.com', 'nutshell': 'nutshell.com', 'zoho': 'zoho.com', 'axonaut': 'axonaut.com', 'amocrm': 'amocrm.com', 'nimble': 'nimble.com', 'nocrm': 'nocrm.io', 'teamleader': 'teamleader.eu'}
     try:
-        await module(email, client, out)
+        if limiter is None:
+            await module(email, client, out)
+        else:
+            async with limiter:
+                await module(email, client, out)
     except Exception:
-        name=str(module).split('<function ')[1].split(' ')[0]
-        out.append({"name": name,"domain":data[name],
+        name = getattr(module, "__name__", str(module))
+        if name not in data:
+            name = str(module).split('<function ')[1].split(' ')[0]
+        out.append({"name": name,"domain":data.get(name, name),
                     "rateLimit": False,
                     "error": True,
                     "exists": False,
                     "emailrecovery": None,
                     "phoneNumber": None,
                     "others": None})
-async def maincore():
+
+
+async def run_batch(emails, websites, client, concurrency=DEFAULT_CONCURRENCY):
+    """Check every email, bounding concurrent site modules globally."""
+    limiter = trio.CapacityLimiter(concurrency)
+    results = [None] * len(emails)
+
+    async def check_email(index, email):
+        out = []
+        async with trio.open_nursery() as nursery:
+            for website in websites:
+                nursery.start_soon(
+                    launch_module,
+                    website,
+                    email,
+                    client,
+                    out,
+                    limiter,
+                )
+        out = deduplicate_results(out)
+        results[index] = (
+            email,
+            sorted(out, key=lambda item: (item.get("name") or "", item.get("domain") or "")),
+        )
+
+    async with trio.open_nursery() as nursery:
+        for index, email in enumerate(emails):
+            nursery.start_soon(check_email, index, email)
+
+    return results
+
+
+def build_parser():
     parser= ArgumentParser(description=f"holehe v{__version__}")
     parser.add_argument("email",
-                    nargs='+', metavar='EMAIL',
-                    help="Target Email")
+                    nargs='*', metavar='EMAIL',
+                    help="Target Email (multiple emails are checked as a batch)")
+    parser.add_argument("-f", "--email-file", "--email-list", action="append", default=[], dest="email_file",
+                    help="Read target emails from a file, one per line (repeatable)")
+    parser.add_argument("-j", "--concurrency", "--max-concurrency", "--workers", type=positive_int,
+                    default=DEFAULT_CONCURRENCY, dest="concurrency",
+                    help=f"Maximum concurrently running site modules (default {DEFAULT_CONCURRENCY})")
+    parser.add_argument("--rate-limit", "--rps", "--requests-per-second", type=non_negative_float,
+                    default=DEFAULT_RATE_LIMIT, dest="rate_limit",
+                    help=f"Maximum HTTP requests per second; 0 disables the limit (default {DEFAULT_RATE_LIMIT:g})")
     parser.add_argument("--only-used", default=False, required=False,action="store_true",dest="onlyused",
                     help="Displays only the sites used by the target email address.")
     parser.add_argument("--no-color", default=False, required=False,action="store_true",dest="nocolor",
@@ -193,14 +408,31 @@ async def maincore():
                     help="Create a CSV with the results")
     parser.add_argument("-T","--timeout", type=int , default=10, required=False,dest="timeout",
                     help="Set max timeout value (default 10)")
+    parser.add_argument("--no-update", default=False, required=False, action="store_true", dest="noupdate",
+                    help="Do not check PyPI for a newer Holehe version")
+    return parser
 
-    check_update()
+
+def print_batch_results(results, args, websites, start_time):
+    """Print one legacy-compatible block per email."""
+    if len(results) == 1:
+        email, data = results[0]
+        print_result(data, args, email, start_time, websites)
+        return
+
+    batch_args = copy.copy(args)
+    batch_args.noclear = True
+    for email, data in results:
+        print_result(data, batch_args, email, start_time, websites)
+
+
+async def maincore():
+    parser = build_parser()
     args = parser.parse_args()
+    if not args.noupdate:
+        check_update()
     credit()
-    email=args.email[0]
-
-    if not is_email(email):
-        exit("[-] Please enter a target email ! \nExample : holehe email@example.com")
+    emails = validate_emails(collect_emails(args))
 
     # Import Modules
     modules = import_submodules("holehe.modules")
@@ -210,24 +442,30 @@ async def maincore():
     # Start time
     start_time = time.time()
     # Def the async client
-    client = httpx.AsyncClient(timeout=timeout)
+    client = RateLimitedAsyncClient(timeout=timeout, rate_limit=args.rate_limit)
     # Launching the modules
-    out = []
-    instrument = TrioProgress(len(websites))
+    instrument = TrioProgress(len(websites) * len(emails))
     trio.lowlevel.add_instrument(instrument)
-    async with trio.open_nursery() as nursery:
-        for website in websites:
-            nursery.start_soon(launch_module, website, email, client, out)
-    trio.lowlevel.remove_instrument(instrument)
-    # Sort by modules names
-    out = sorted(out, key=lambda i: i['name'])
-    # Close the client
-    await client.aclose()
-    # Print the result
-    print_result(out,args,email,start_time,websites)
+    try:
+        results = await run_batch(
+            emails,
+            websites,
+            client,
+            concurrency=args.concurrency,
+        )
+    finally:
+        trio.lowlevel.remove_instrument(instrument)
+        instrument.close()
+        await client.aclose()
+    # Print the results
+    print_batch_results(results, args, websites, start_time)
     credit()
     # Export results
-    export_csv(out,args,email)
+    if len(results) == 1:
+        email, out = results[0]
+        export_csv(out,args,email)
+    else:
+        export_batch_csv(results, args)
 
 def main():
     trio.run(maincore)
